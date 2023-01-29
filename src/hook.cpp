@@ -67,12 +67,72 @@ void *__libc_dlopen_mode(const char *name, int mode);
 #define CUDA_SYMBOL_STRING(x) STRINGIFY(x)
 #define SYNCP_MESSAGE
 
+
 typedef void *(*fnDlsym)(void *, const char *);
 
+void resetDlInfo(Dl_info *info) {
+    if(info == NULL) return;
+    info->dli_fbase = NULL;
+    info->dli_fname = NULL;
+    info->dli_sname = NULL;
+    info->dli_saddr = NULL;
+}
+
+/* Brute force method to guess the original dlsym address
+   (we cannot easily find it because we have erased the dlsym
+   symbol and recent libc versions do not expose
+   dlsym like symbols anymore...)
+*/
+fnDlsym scan_address_space() {
+#ifdef _DEBUG
+    printf("Scan address space to get dlsym original address\n");
+#endif
+    int bytes_around = 1000;
+    int b;
+
+    char *candidate_addr = ((char *) dlopen) - bytes_around;
+
+    Dl_info info;
+
+    for(b=0; b < 2 * bytes_around + 1; b++){
+        resetDlInfo(&info);
+        candidate_addr += 1;
+        dladdr((void *)candidate_addr, &info);
+        if(info.dli_sname != NULL)
+        {
+#ifdef _DEBUG
+            printf("Found symbol %s address %p!\n", info.dli_sname, (char *) info.dli_saddr);
+#endif
+            if(strcmp(info.dli_sname,"dlsym") == 0) {
+#ifdef _DEBUG
+                printf("Real dlsym found !! Address %p in file %s\n", (char *) info.dli_saddr, info.dli_fname);
+#endif
+                return (fnDlsym) info.dli_saddr;
+            }
+        }
+    }
+    return NULL;
+}
+
+
+
 static void *real_dlsym(void *handle, const char *symbol) {
-  static fnDlsym internal_dlsym =
-      (fnDlsym)__libc_dlsym(__libc_dlopen_mode("libdl.so.2", RTLD_LAZY), "dlsym");
-  return (*internal_dlsym)(handle, symbol);
+    static fnDlsym o_dlsym = NULL;
+
+#ifdef _DEBUG
+    printf("OH YEAH dlsym called for symbol %s\n", symbol);
+#endif
+    if(o_dlsym == NULL)
+    {
+        o_dlsym = scan_address_space();
+
+        if(o_dlsym == NULL)
+        {
+            perror("Not able to get original dlsym address !\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+  return (*o_dlsym)(handle, symbol);
 }
 
 struct hookInfo {
