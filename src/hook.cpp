@@ -68,8 +68,8 @@ void *__libc_dlopen_mode(const char *name, int mode);
 #define SYNCP_MESSAGE
 
 typedef struct MemInfo {
-  long long unsigned total = (long long unsigned) 1 << (long long unsigned) 32;
-  long long unsigned used = 0;
+  size_t total = (long unsigned) 1 << (long unsigned) 32;
+  size_t used = 0;
 } MemInfo;
 
 MemInfo get_mem_info() {
@@ -456,11 +456,14 @@ std::pair<size_t, size_t> get_gpu_memory_info() {
  * @param is_allocate 1 for allocation, 0 for free
  * @return request succeed or not
  */
-int update_memory_usage(size_t bytes, int is_allocate) {
+CUresult update_memory_usage(size_t bytes, int is_allocate) {
   
   MemInfo memInfo = get_mem_info();
   if(is_allocate) {
     size_t freeMem = memInfo.total - memInfo.used;
+    printf("Trying to allocate %lu bytes\n", bytes);
+    printf("Free memory %lu bytes\n", freeMem);
+    printf("Used memory %lu bytes\n", memInfo.used);
     if(freeMem < bytes) {
       return CUDA_ERROR_OUT_OF_MEMORY;
     }
@@ -472,6 +475,9 @@ int update_memory_usage(size_t bytes, int is_allocate) {
       memInfo.used = 0;
     }
   }
+  printf("Success\n");
+  printf("Allocated %lu\n", memInfo.used);
+  printf("MemInfo address %p", &memInfo);
   return CUDA_SUCCESS;
   // char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   // size_t rpos = 0;
@@ -716,18 +722,20 @@ CUresult cuMemAlloc_prehook(CUdeviceptr *dptr, size_t bytesize) {
 CUresult cuMemAlloc_posthook(CUdeviceptr *dptr, size_t bytesize) {
   int device = get_current_device_id();
   pthread_mutex_lock(&allocation_mutex);
+  allocation_map[device][*dptr] = bytesize;
   // send memory usage update to backend
-  if (!update_memory_usage(bytesize, 1)) {
+  CUresult res = update_memory_usage(bytesize, 1);
+  if (res != CUDA_SUCCESS) {
     pthread_mutex_unlock(&allocation_mutex);
     ERROR("Allocate too much memory!");
     cuMemFree(*dptr);
     return CUDA_ERROR_OUT_OF_MEMORY;
   }
-  allocation_map[device][*dptr] = bytesize;
+  // allocation_map[device][*dptr] = bytesize;
   // gpu_mem_used[device] += bytesize;
   pthread_mutex_unlock(&allocation_mutex);
 
-  return CUDA_SUCCESS;
+  return res;
 }
 
 CUresult cuMemAllocManaged_prehook(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
@@ -871,13 +879,67 @@ typedef CUresult CUDAAPI(*fnCuGetProcAddress) (const char*, void **, int, cuuint
 static fnCuGetProcAddress oCuGetProcAddress;
 
 
+
 CUresult nestedCuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags) {
   printf("Nested cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n",
          symbol, cudaVersion, flags);
-  res = oCuGetProcAddress(symbol, pfn, cudaVersion, flags);
+
+//   U_HOOK_GENERATE_INTERCEPT(CU_HOOK_MEM_ALLOC, cuMemAlloc, (CUdeviceptr * dptr, size_t bytesize),
+//                            dptr, bytesize)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MEM_ALLOC_MANAGED, cuMemAllocManaged,
+//                            (CUdeviceptr * dptr, size_t bytesize, unsigned int flags), dptr,
+//                            bytesize, flags)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MEM_ALLOC_PITCH, cuMemAllocPitch,
+//                            (CUdeviceptr * dptr, size_t *pPitch, size_t WidthInBytes, size_t Height,
+//                             unsigned int ElementSizeBytes),
+//                            dptr, pPitch, WidthInBytes, Height, ElementSizeBytes)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MEM_FREE, cuMemFree, (CUdeviceptr dptr), dptr)
+
+// // cuda driver array/array_destroy APIs
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_ARRAY_CREATE, cuArrayCreate,
+//                            (CUarray * pHandle, const CUDA_ARRAY_DESCRIPTOR *pAllocateArray),
+//                            pHandle, pAllocateArray)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_ARRAY3D_CREATE, cuArray3DCreate,
+//                            (CUarray * pHandle, const CUDA_ARRAY3D_DESCRIPTOR *pAllocateArray),
+//                            pHandle, pAllocateArray)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MIPMAPPED_ARRAY_CREATE, cuMipmappedArrayCreate,
+//                            (CUmipmappedArray * pHandle,
+//                             const CUDA_ARRAY3D_DESCRIPTOR *pMipmappedArrayDesc,
+//                             unsigned int numMipmapLevels),
+//                            pHandle, pMipmappedArrayDesc, numMipmapLevels)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_ARRAY_DESTROY, cuArrayDestroy, (CUarray hArray), hArray)
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MIPMAPPED_ARRAY_DESTROY, cuMipmappedArrayDestroy,
+//                            (CUmipmappedArray hMipmappedArray), hMipmappedArray)
+
+  if(strcmp(symbol, "cuMemAlloc") == 0) {
+    *pfn = (void *) &cuMemAlloc;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuMemAllocManaged") == 0) {
+    *pfn = (void *) &cuMemAllocManaged;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuMemAllocPitch") == 0) {
+    *pfn = (void *) &cuMemAllocPitch;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuArrayCreate") == 0) {
+    *pfn = (void *) &cuArrayCreate;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuArray3DCreate") == 0) {
+    *pfn = (void *) &cuArray3DCreate;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuMipmappedArrayCreate") == 0) {
+    *pfn = (void *) &cuMipmappedArrayCreate;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuArrayDestroy") == 0) {
+    *pfn = (void *) &cuArrayDestroy;
+    return CUDA_SUCCESS;
+  } else if (strcmp(symbol, "cuMipmappedArrayDestroy") == 0) {
+    *pfn = (void *) &cuMipmappedArrayDestroy;
+    return CUDA_SUCCESS;
+  }
+  
+  CUresult res = oCuGetProcAddress(symbol, pfn, cudaVersion, flags);
   return res;
 }
-
 
 CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags){
   printf("cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n", 
@@ -893,7 +955,7 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuui
     
     if(oCuGetProcAddress == NULL)
     {
-      result = real_func(symbol, &oCuGetProcAddress, cudaVersion, flags);
+      CUresult result = real_func(symbol, (void **)&oCuGetProcAddress, cudaVersion, flags);
       if(result != CUDA_SUCCESS){
         return result;
       }
@@ -989,6 +1051,7 @@ CUstream hStream;  // redundent variable used for macro expansion
                                                                                           \
     return (result);                                                                      \
   }
+
 
 // CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MEMCPY_ATOH, cuMemcpyAtoH,
 //                            (void *dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount),
