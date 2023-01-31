@@ -36,6 +36,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include <climits>
 #include <cmath>
@@ -50,31 +51,31 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
+#include "nvml.h"
 #include "comm.h"
 #include "debug.h"
 #include "predictor.h"
 #include "util.h"
 
-extern "C" {
-void *__libc_dlsym(void *map, const char *name);
-}
-extern "C" {
-void *__libc_dlopen_mode(const char *name, int mode);
-}
+// extern "C" {
+// void *__libc_dlsym(void *map, const char *name);
+// }
+// extern "C" {
+// void *__libc_dlopen_mode(const char *name, int mode);
+// }
 
 #define STRINGIFY(x) #x
 #define CUDA_SYMBOL_STRING(x) STRINGIFY(x)
 #define SYNCP_MESSAGE
 
 typedef struct MemInfo {
-  size_t total = (long unsigned) 1 << (long unsigned) 32;
-  size_t used = 0;
+  size_t total; //= (long unsigned) 1 << (long unsigned) 32;
+  size_t used; //= 0;
 } MemInfo;
 
-MemInfo get_mem_info() {
-  static MemInfo memInfo;
-  return memInfo;
+MemInfo *get_mem_info() {
+  static MemInfo memInfo = {(long unsigned) 1 << (long unsigned) 32, 0};
+  return &memInfo;
 }
 
 typedef void *(*fnDlsym)(void *, const char *);
@@ -123,8 +124,6 @@ fnDlsym scan_address_space() {
     return NULL;
 }
 
-
-
 static void *real_dlsym(void *handle, const char *symbol) {
     static fnDlsym o_dlsym = NULL;
 
@@ -168,7 +167,7 @@ static struct hookInfo hook_inf;
  */
 void *dlsym(void *handle, const char *symbol) {
   // Early out if not a CUDA driver symbol
-  if (strncmp(symbol, "cu", 2) != 0) {
+  if ((strncmp(symbol, "cu", 2) != 0) && (strcmp(symbol, "nvmlDeviceGetMemoryInfo_v2") != 0)) {
     return (real_dlsym(handle, symbol));
   }
 
@@ -230,7 +229,10 @@ void *dlsym(void *handle, const char *symbol) {
     return (void *)(&cuCtxPushCurrent);
   } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuGetProcAddress)) == 0){
     return (void *)(&cuGetProcAddress);
+  } else if (strcmp(symbol, "nvmlDeviceGetMemoryInfo_v2") == 0) {
+    return (void *) (&nvmlDeviceGetMemoryInfo_v2);
   }
+
   // omit cuDeviceTotalMem here so there won't be a deadlock in cudaEventCreate when we are in
   // initialize(). Functions called by cliet are still being intercepted.
   return (real_dlsym(handle, symbol));
@@ -426,8 +428,8 @@ int get_current_device_id() {
  * @return remaining memory, memory limit
  */
 std::pair<size_t, size_t> get_gpu_memory_info() {
-  MemInfo memInfo = get_mem_info();
-  return std::make_pair(memInfo.total - memInfo.used, memInfo.total);
+  MemInfo *memInfo = get_mem_info();
+  return std::make_pair(memInfo->total - memInfo->used, memInfo->total);
   // char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   // size_t rpos = 0;
   // int rc;
@@ -457,27 +459,29 @@ std::pair<size_t, size_t> get_gpu_memory_info() {
  * @return request succeed or not
  */
 CUresult update_memory_usage(size_t bytes, int is_allocate) {
-  
-  MemInfo memInfo = get_mem_info();
+
+  MemInfo *memInfo = get_mem_info();
   if(is_allocate) {
-    size_t freeMem = memInfo.total - memInfo.used;
+    size_t freeMem = memInfo->total - memInfo->used;
     printf("Trying to allocate %lu bytes\n", bytes);
     printf("Free memory %lu bytes\n", freeMem);
-    printf("Used memory %lu bytes\n", memInfo.used);
+    printf("Used memory %lu bytes\n", memInfo->used);
     if(freeMem < bytes) {
       return CUDA_ERROR_OUT_OF_MEMORY;
     }
-    memInfo.used += bytes;
+    memInfo->used += bytes;
   }
   else {
-    memInfo.used -= bytes;
-    if(memInfo.used < 0) {
-      memInfo.used = 0;
+    memInfo->used -= bytes;
+    if(memInfo->used < 0) {
+      memInfo->used = 0;
     }
   }
   printf("Success\n");
-  printf("Allocated %lu\n", memInfo.used);
-  printf("MemInfo address %p", &memInfo);
+  pid_t tid = syscall(__NR_gettid);
+
+  printf("Thread id %d Allocated %lu\n", tid, memInfo->used);
+  printf("MemInfo address %p\n", memInfo);
   return CUDA_SUCCESS;
   // char sbuf[REQ_MSG_LEN], rbuf[RSP_MSG_LEN], *attached;
   // size_t rpos = 0;
@@ -846,7 +850,7 @@ CUresult cuMipmappedArrayCreate_posthook(CUmipmappedArray *pHandle,
 // }
 
 //FIXME: dependent on version -> 12+
-// CUresult cuGetProcAddress_preHook(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags, 
+// CUresult cuGetProcAddress_preHook(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags,
 //                                   CUdriverProcAddressQueryResult* symbolStatus){
 //   printf("cuGetProcAddress called for symbol %s and cuda version %d !!!\n", symbol, cudaVersion);
 //   return CUDA_SUCCESS;
@@ -936,13 +940,13 @@ CUresult nestedCuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion
     *pfn = (void *) &cuMipmappedArrayDestroy;
     return CUDA_SUCCESS;
   }
-  
+
   CUresult res = oCuGetProcAddress(symbol, pfn, cudaVersion, flags);
   return res;
 }
 
 CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags){
-  printf("cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n", 
+  printf("cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n",
          symbol, cudaVersion, flags);
 
   static fnCuGetProcAddress real_func = NULL;
@@ -952,7 +956,7 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuui
 
   if(strcmp(symbol, "cuGetProcAddress") == 0) {
     printf("cuGetProcAddress on self!!!\n");
-    
+
     if(oCuGetProcAddress == NULL)
     {
       CUresult result = real_func(symbol, (void **)&oCuGetProcAddress, cudaVersion, flags);
@@ -964,7 +968,7 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuui
     *pfn = (void *) nestedCuGetProcAddress;
     return CUDA_SUCCESS;
   }
-  
+
   CUresult result = real_func(symbol, pfn, cudaVersion, flags);
   return result;
 }
@@ -1112,10 +1116,10 @@ CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MIPMAPPED_ARRAY_DESTROY, cuMipmappedArrayDest
                            (CUmipmappedArray hMipmappedArray), hMipmappedArray)
 
 //FIXME: depends on cuda version
-// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_GET_PROC_ADDRESS, cuGetProcAddress, 
-//                            const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags, 
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_GET_PROC_ADDRESS, cuGetProcAddress,
+//                            const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags,
 //                            CUdriverProcAddressQueryResult* symbolStatus)
-// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_GET_PROC_ADDRESS, cuGetProcAddress, 
+// CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_GET_PROC_ADDRESS, cuGetProcAddress,
 //                            (const char* symbol, void** pfn, int cudaVersion, cuuint64_t flags), symbol, pfn, cudaVersion, flags)
 
 // cuda driver kernel launch APIs
@@ -1151,3 +1155,16 @@ CUresult CUDAAPI cuMemGetInfo(size_t *gpu_mem_free, size_t *gpu_mem_total) {
   *gpu_mem_total = mem_info.second;
   return CUDA_SUCCESS;
 }
+
+nvmlReturn_t DECLDIR nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *memory)
+{
+  printf("HELLO MEM INFO\n");
+  MemInfo *memInfo = get_mem_info();
+  memory->version = 2;
+  memory->total = memInfo->total;
+  memory->reserved = 0;
+  memory->used = memInfo->used;
+  memory->free = memory->total - memory->reserved - memory->used;
+  return NVML_SUCCESS;
+}
+
