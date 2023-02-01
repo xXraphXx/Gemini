@@ -58,8 +58,52 @@
 #include "util.h"
 
 #define STRINGIFY(x) #x
-#define CUDA_SYMBOL_STRING(x) STRINGIFY(x)
-#define SYNCP_MESSAGE
+#define EXPAND_STRINGIFY(x) STRINGIFY(x)
+
+// Interceptor forge
+#define FUNC_TYPE_NAME(name)   name##FnType
+#define FUNC_VARIABLE_NAME(name) name##FnVariable
+#define FUNC_MUTEX_NAME(name)  name##FnMutex
+#define CU_HOOK_GENERATE_INTERCEPT(hooksymbol, funcname, params, ...)                                       \
+typedef CUresult CUDAAPI(*FUNC_TYPE_NAME(funcname)) params;                                                 \
+static FUNC_TYPE_NAME(funcname) FUNC_VARIABLE_NAME(funcname);                                                 \
+static pthread_mutex_t FUNC_MUTEX_NAME(funcname) = PTHREAD_MUTEX_INITIALIZER;                               \
+CUresult CUDAAPI funcname params {                                                                          \
+  pthread_once(&init_done, initialize);                                                                     \
+  if(FUNC_VARIABLE_NAME(funcname) == NULL) {                                                \
+    pthread_mutex_lock(&FUNC_MUTEX_NAME(funcname));                                       \
+    if(FUNC_VARIABLE_NAME(funcname) == NULL) {                                              \
+      static void *real_func = (void *)real_dlsym(RTLD_NEXT, STRINGIFY(funcname));                   \
+      if(real_func == NULL) {                                                                               \
+        perror("Symbol " STRINGIFY(funcname) " not found\n"); \
+        pthread_mutex_unlock(&FUNC_MUTEX_NAME(funcname));                                        \
+        exit(EXIT_FAILURE);                                                                                 \
+      }                                                                                                     \
+      FUNC_VARIABLE_NAME(funcname) = (FUNC_TYPE_NAME(funcname)) real_func;\
+    }                                                                                                       \
+    pthread_mutex_unlock(&FUNC_MUTEX_NAME(funcname));                                     \
+  }                                                                                                         \
+  CUresult result = CUDA_SUCCESS;                                                                           \
+                                                                                                            \
+  if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                                               \
+  if (hook_inf.preHooks[hooksymbol])                                                                        \
+    result = ((FUNC_TYPE_NAME(funcname))hook_inf.preHooks[hooksymbol])(__VA_ARGS__);      \
+  if (result != CUDA_SUCCESS) return (result);                                                              \
+  result = (FUNC_VARIABLE_NAME(funcname))(__VA_ARGS__);                                     \
+  if (hook_inf.postHooks[hooksymbol] && result == CUDA_SUCCESS)                                             \
+    result = ((FUNC_TYPE_NAME(funcname))hook_inf.postHooks[hooksymbol])(__VA_ARGS__);     \
+                                                                                                            \
+  return (result);                                                                                          \
+}
+
+
+#define LOAD_SYMBOL_ADDR(funcname) \
+    pthread_mutex_lock(&FUNC_MUTEX_NAME(funcname)); \
+    result = oCuGetProcAddress(symbol, (void **)&FUNC_VARIABLE_NAME(funcname), cudaVersion, flags); \
+    if(result == CUDA_SUCCESS){ \
+      *pfn = (void *) &funcname; \
+    } \
+    pthread_mutex_unlock(&FUNC_MUTEX_NAME(funcname));
 
 typedef struct MemInfo {
   size_t total;
@@ -164,31 +208,31 @@ void *dlsym(void *handle, const char *symbol) {
     return (real_dlsym(handle, symbol));
   }
 
-  if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAlloc)) == 0) {
+  if (strcmp(symbol, EXPAND_STRINGIFY(cuMemAlloc)) == 0) {
     return (void *)(&cuMemAlloc);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAllocManaged)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuMemAllocManaged)) == 0) {
     return (void *)(&cuMemAllocManaged);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemAllocPitch)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuMemAllocPitch)) == 0) {
     return (void *)(&cuMemAllocPitch);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemFree)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuMemFree)) == 0) {
     return (void *)(&cuMemFree);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuArrayCreate)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuArrayCreate)) == 0) {
     return (void *)(&cuArrayCreate);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuArray3DCreate)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuArray3DCreate)) == 0) {
     return (void *)(&cuArray3DCreate);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuArrayDestroy)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuArrayDestroy)) == 0) {
     return (void *)(&cuArrayDestroy);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMipmappedArrayCreate)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuMipmappedArrayCreate)) == 0) {
     return (void *)(&cuMipmappedArrayCreate);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMipmappedArrayDestroy)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuMipmappedArrayDestroy)) == 0) {
     return (void *)(&cuMipmappedArrayDestroy);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuMemGetInfo)) == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuMemGetInfo)) == 0) {
     return (void *)(&cuMemGetInfo);
-  } else if (strcmp(symbol, CUDA_SYMBOL_STRING(cuGetProcAddress)) == 0){
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuGetProcAddress)) == 0){
     return (void *)(&cuGetProcAddress);
   } else if (strcmp(symbol, "nvmlDeviceGetMemoryInfo_v2") == 0) {
     return (void *) (&nvmlDeviceGetMemoryInfo_v2);
-  } else if (strcmp(symbol, "cuDeviceTotalMem") == 0) {
+  } else if (strcmp(symbol, EXPAND_STRINGIFY(cuDeviceTotalMem)) == 0) {
     return (void *) (&cuDeviceTotalMem);
   }
   // omit cuDeviceTotalMem here so there won't be a deadlock in cudaEventCreate when we are in
@@ -204,10 +248,8 @@ static pthread_once_t init_done = PTHREAD_ONCE_INIT;
 
 // GPU memory allocation information
 pthread_mutex_t allocation_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 std::map<CUdeviceptr, size_t> allocation_map[max_gpu_num];
 size_t gpu_mem_used[max_gpu_num] = {0};  // local accounting only
-
 
 /**
  * Handle get current device id
@@ -422,76 +464,6 @@ CUresult cuMipmappedArrayCreate_posthook(CUmipmappedArray *pHandle,
 //   return CUDA_SUCCESS;
 // }
 
-typedef CUresult CUDAAPI(*fnCuGetProcAddress) (const char*, void **, int, cuuint64_t);
-// FIXME: handle cudaversion and flags!!!!
-static fnCuGetProcAddress oCuGetProcAddress;
-
-
-
-CUresult nestedCuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags) {
-  printf("Nested cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n",
-         symbol, cudaVersion, flags);
-
-  if(strcmp(symbol, "cuMemAlloc") == 0) {
-    *pfn = (void *) &cuMemAlloc;
-    return CUDA_SUCCESS;
-  } else if(strcmp(symbol, "cuMemFree") == 0) {
-    *pfn = (void *) &cuMemFree;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuMemAllocManaged") == 0) {
-    *pfn = (void *) &cuMemAllocManaged;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuMemAllocPitch") == 0) {
-    *pfn = (void *) &cuMemAllocPitch;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuArrayCreate") == 0) {
-    *pfn = (void *) &cuArrayCreate;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuArray3DCreate") == 0) {
-    *pfn = (void *) &cuArray3DCreate;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuMipmappedArrayCreate") == 0) {
-    *pfn = (void *) &cuMipmappedArrayCreate;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuArrayDestroy") == 0) {
-    *pfn = (void *) &cuArrayDestroy;
-    return CUDA_SUCCESS;
-  } else if (strcmp(symbol, "cuMipmappedArrayDestroy") == 0) {
-    *pfn = (void *) &cuMipmappedArrayDestroy;
-    return CUDA_SUCCESS;
-  }
-
-  CUresult res = oCuGetProcAddress(symbol, pfn, cudaVersion, flags);
-  return res;
-}
-
-CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags){
-  printf("cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n",
-         symbol, cudaVersion, flags);
-
-  static fnCuGetProcAddress real_func = NULL;
-  if(real_func == NULL) {
-    real_func = (fnCuGetProcAddress) real_dlsym(RTLD_NEXT, CUDA_SYMBOL_STRING(cuGetProcAddress));
-  }
-
-  if(strcmp(symbol, "cuGetProcAddress") == 0) {
-    printf("cuGetProcAddress on self!!!\n");
-
-    if(oCuGetProcAddress == NULL)
-    {
-      CUresult result = real_func(symbol, (void **)&oCuGetProcAddress, cudaVersion, flags);
-      if(result != CUDA_SUCCESS){
-        return result;
-      }
-    }
-
-    *pfn = (void *) nestedCuGetProcAddress;
-    return CUDA_SUCCESS;
-  }
-
-  CUresult result = real_func(symbol, pfn, cudaVersion, flags);
-  return result;
-}
 
 void initialize() {
   hook_inf.postHooks[CU_HOOK_MEM_ALLOC] = (void *)cuMemAlloc_posthook;
@@ -512,24 +484,6 @@ void initialize() {
   hook_inf.preHooks[CU_HOOK_MIPMAPPED_ARRAY_CREATE] = (void *)cuMipmappedArrayCreate_prehook;
 }
 
-#define CU_HOOK_GENERATE_INTERCEPT(hooksymbol, funcname, params, ...)                     \
-  CUresult CUDAAPI funcname params {                                                      \
-    pthread_once(&init_done, initialize);                                                 \
-                                                                                          \
-    static void *real_func = (void *)real_dlsym(RTLD_NEXT, CUDA_SYMBOL_STRING(funcname)); \
-    CUresult result = CUDA_SUCCESS;                                                       \
-                                                                                          \
-    if (hook_inf.debug_mode) hook_inf.call_count[hooksymbol]++;                           \
-                                                                                          \
-    if (hook_inf.preHooks[hooksymbol])                                                    \
-      result = ((CUresult CUDAAPI(*) params)hook_inf.preHooks[hooksymbol])(__VA_ARGS__);  \
-    if (result != CUDA_SUCCESS) return (result);                                          \
-    result = ((CUresult CUDAAPI(*) params)real_func)(__VA_ARGS__);                        \
-    if (hook_inf.postHooks[hooksymbol] && result == CUDA_SUCCESS)                         \
-      result = ((CUresult CUDAAPI(*) params)hook_inf.postHooks[hooksymbol])(__VA_ARGS__); \
-                                                                                          \
-    return (result);                                                                      \
-  }
 
 // cuda driver alloc/free APIs
 CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MEM_ALLOC, cuMemAlloc, (CUdeviceptr * dptr, size_t bytesize),
@@ -559,11 +513,120 @@ CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_ARRAY_DESTROY, cuArrayDestroy, (CUarray hArra
 CU_HOOK_GENERATE_INTERCEPT(CU_HOOK_MIPMAPPED_ARRAY_DESTROY, cuMipmappedArrayDestroy,
                            (CUmipmappedArray hMipmappedArray), hMipmappedArray)
 
+
+
+// FIXME: no solution, now, how to handle cudaversion and flags wihtout self modifying code on runtime ?
+// We should be ok for the vast majority of use cases. Only programs using two different versions of a
+// same symbol at runtime will cause troubles.
+typedef CUresult CUDAAPI(*fnCuGetProcAddress) (const char*, void **, int, cuuint64_t);
+static fnCuGetProcAddress oCuGetProcAddress;
+static pthread_mutex_t updateCudaProcAddr = PTHREAD_MUTEX_INITIALIZER;
+
+CUresult nestedCuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags) {
+  #ifdef _DEBUG
+  printf("Nested cuGetProcAddress called for symbol %s and cuda version %d and "
+         "flags %lu, current cuGetProcAddr ptr %p !!!\n",
+         symbol, cudaVersion, flags, oCuGetProcAddress);
+  #endif
+
+  CUresult result;
+  if(strcmp(symbol, "cuGetProcAddress") == 0) {
+    #ifdef _DEBUG
+    printf("Nested cuGetProcAddress detected\n");
+    #endif
+    pthread_mutex_lock(&updateCudaProcAddr);
+    void *fptr;
+    result = oCuGetProcAddress(symbol, &fptr, cudaVersion, flags);
+    if(result == CUDA_SUCCESS){
+      oCuGetProcAddress = (fnCuGetProcAddress) fptr;
+      *pfn = (void *) &nestedCuGetProcAddress;
+    }
+    pthread_mutex_unlock(&updateCudaProcAddr);
+  } else if(strcmp(symbol, "cuMemAlloc") == 0) {
+    LOAD_SYMBOL_ADDR(cuMemAlloc)
+  } else if(strcmp(symbol, "cuMemFree") == 0) {
+    LOAD_SYMBOL_ADDR(cuMemFree)
+  } else if (strcmp(symbol, "cuMemAllocManaged") == 0) {
+    LOAD_SYMBOL_ADDR(cuMemAllocManaged)
+  } else if (strcmp(symbol, "cuMemAllocPitch") == 0) {
+    LOAD_SYMBOL_ADDR(cuMemAllocPitch)
+  } else if (strcmp(symbol, "cuArrayCreate") == 0) {
+    LOAD_SYMBOL_ADDR(cuArrayCreate)
+  } else if (strcmp(symbol, "cuArray3DCreate") == 0) {
+    LOAD_SYMBOL_ADDR(cuArray3DCreate)
+  } else if (strcmp(symbol, "cuMipmappedArrayCreate") == 0) {
+    LOAD_SYMBOL_ADDR(cuMipmappedArrayCreate)
+  } else if (strcmp(symbol, "cuArrayDestroy") == 0) {
+    LOAD_SYMBOL_ADDR(cuArrayDestroy)
+  } else if (strcmp(symbol, "cuMipmappedArrayDestroy") == 0) {
+    LOAD_SYMBOL_ADDR(cuMipmappedArrayDestroy)
+  } else if (strcmp(symbol, "cuDeviceTotalMem") == 0) {
+    *pfn = (void *) &cuDeviceTotalMem;
+    result = CUDA_SUCCESS;
+  } else {
+    result = oCuGetProcAddress(symbol, pfn, cudaVersion, flags);
+  }
+
+  return result;
+}
+
+// FIXME: versioning not correctly handled here. Only one symbol version can be used at once
+CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags){
+  CUresult result;
+  #ifdef _DEBUG
+  printf("Heading cuGetProcAddress called for symbol %s and cuda version %d and flags %lu !!!\n",
+         symbol, cudaVersion, flags);
+  #endif
+  static fnCuGetProcAddress real_func = NULL;
+  if(real_func == NULL)
+  {
+    pthread_mutex_lock(&updateCudaProcAddr);
+    if(real_func == NULL) {
+
+      real_func = (fnCuGetProcAddress) real_dlsym(RTLD_NEXT, EXPAND_STRINGIFY(cuGetProcAddress));
+    }
+    pthread_mutex_unlock(&updateCudaProcAddr);
+  }
+
+  if(strcmp(symbol, "cuGetProcAddress") == 0) {
+    #ifdef _DEBUG
+    printf("cuGetProcAddress on self!!!\n");
+    #endif
+    pthread_mutex_lock(&updateCudaProcAddr);
+    result = real_func(symbol, (void **)&oCuGetProcAddress, cudaVersion, flags);
+    pthread_mutex_unlock(&updateCudaProcAddr);
+    #ifdef _DEBUG
+    if(oCuGetProcAddress != real_func) {
+      printf("Next cuGetProcAddress is different from the original one %p != %p\n", oCuGetProcAddress, real_func);
+    }
+    #endif
+    if(result != CUDA_SUCCESS) return result;
+    *pfn = (void *) nestedCuGetProcAddress;
+    return result;
+  }
+
+  // symbol is not cuGetProcAddress
+  pthread_mutex_lock(&updateCudaProcAddr);
+  #ifdef _DEBUG
+  printf("Original cuGetProcAddress called for symbol %s\n", symbol);
+  if(oCuGetProcAddress == NULL) {
+    printf("No nested cuGetProcAddress yet, erasing nested cuGetProcAddress by original one\n");
+  }
+  else if (oCuGetProcAddress != real_func) {
+    printf("Replacing nested cuGetProcAddress with the original one\n");
+  }
+  #endif
+  oCuGetProcAddress = real_func;
+  pthread_mutex_unlock(&updateCudaProcAddr);
+  result = nestedCuGetProcAddress(symbol, pfn, cudaVersion, flags);
+  return result;
+}
+
 // cuda driver mem info APIs
 CUresult CUDAAPI cuDeviceTotalMem(size_t *bytes, CUdevice dev) {
   pthread_once(&init_done, initialize);
   std::pair<size_t, size_t> mem_info = get_gpu_memory_info();
-  if (hook_inf.debug_mode) hook_inf.call_count[CU_HOOK_DEVICE_TOTOAL_MEM]++;
+  if (hook_inf.debug_mode) hook_inf.call_count[CU_HOOK_DEVICE_TOTAL_MEM]++;
   *bytes = mem_info.second;
   return CUDA_SUCCESS;
 }
